@@ -1,0 +1,128 @@
+import base64
+import time
+import os
+import requests
+import logging
+import uuid
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import FSInputFile
+from transformers import pipeline  # Для анализа эмоций
+from dotenv import load_dotenv
+
+load_dotenv()
+
+bot = Bot(token=os.getenv("BOT_TOKEN"))
+dp = Dispatcher()
+
+# Инициализация модели для анализа эмоций
+emotion_classifier = pipeline(
+    "text-classification",
+    model="cointegrated/rubert-tiny2-cedr-emotion-detection",
+    return_all_scores=False
+)
+
+# Конфигурация API генерации изображений
+FUSIONBRAIN_API_URL = "https://api.fusionbrain.ai/web/api/v1/text2image/generation"
+API_KEY = os.getenv("FUSIONBRAIN_API_KEY")
+API_SECRET = os.getenv("FUSIONBRAIN_API_SECRET")
+
+
+def generate_art(emotion: str) -> str:
+    """Генерирует арт-объект через FusionBrain по эмоции"""
+    # Сопоставление эмоций с русскими описаниями
+    emotion_prompts = {
+        'happiness': "радостный абстрактный объект, яркие цвета, праздничная атмосфера",
+        'sadness': "меланхоличная абстракция, приглушенные тона, дождливый день",
+        'anger': "динамичная композиция, агрессивные формы, красные и черные тона",
+        'fear': "темная абстракция, размытые контуры, тревожная атмосфера",
+        'neutral': "минималистичный геометрический объект, пастельные тона"
+    }
+    prompt = emotion_prompts.get(emotion, "абстрактное искусство")
+
+    # Формируем запрос
+    headers = {
+        "X-Key": f"Key {API_KEY}",
+        "X-Secret": f"Secret {API_SECRET}",
+    }
+    data = {
+        "model_id": 1,  # Kandinsky 2.1
+        "params": {
+            "type": "GENERATE",
+            "width": 1024,
+            "height": 1024,
+            "num_images": 1,
+            "generateParams": {
+                "query": prompt
+            }
+        }
+    }
+    print("API_KEY =", API_KEY)
+    print("API_SECRET =", API_SECRET)
+
+    # Отправляем запрос на генерацию
+    response = requests.post(FUSIONBRAIN_API_URL, json=data, headers=headers)
+    if response.status_code != 200:
+        logging.error(f"Ошибка генерации: {response.status_code} — {response.text}")
+        return None
+
+    task_id = response.json()['uuid']
+
+    # Проверяем статус генерации
+    for _ in range(10):
+        status_response = requests.get(
+            f"{FUSIONBRAIN_API_URL}/status/{task_id}",
+            headers=headers
+        )
+        status = status_response.json()
+        if status['status'] == 'DONE':
+            image_base64 = status['images'][0]
+            image_data = base64.b64decode(image_base64)
+
+            # Сохраняем временный файл
+            filename = f"art_{uuid.uuid4()}.png"
+            with open(filename, "wb") as f:
+                f.write(image_data)
+            return filename
+
+        time.sleep(5)
+
+    return None
+
+
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    await message.answer(
+        "🎨 Привет! Я - эмоциональный художник. Напиши любое сообщение, "
+        "и я создам уникальный арт-объект, отражающий твое настроение!\n\n"
+        "Пример: «Только что закончил сложный проект, чувствую облегчение»"
+    )
+
+
+@dp.message(F.text)
+async def process_message(message: types.Message):
+    # Определяем эмоцию
+    emotion_result = emotion_classifier(message.text)[0]
+    emotion = emotion_result['label']
+    confidence = emotion_result['score']
+
+    await message.reply(f"🎭 Эмоция: {emotion} (точность: {confidence:.2f})")
+
+    # Генерируем арт
+    temp_msg = await message.answer("🖌 Создаю арт-объект...")
+    image_path = generate_art(emotion)
+
+    if image_path:
+        await bot.delete_message(chat_id=message.chat.id, message_id=temp_msg.message_id)
+        await message.reply_photo(
+            FSInputFile(image_path),
+            caption=f"Ваш эмоциональный арт: {emotion}"
+        )
+        os.remove(image_path)  # Удаляем временный файл
+    else:
+        await message.reply("⚠️ Не удалось создать изображение. Попробуйте позже")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    dp.run_polling(bot)
